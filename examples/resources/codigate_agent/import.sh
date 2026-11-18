@@ -1,0 +1,1 @@
+terraform import codigate_agent.home agt_0123456789abcdef

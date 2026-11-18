@@ -1,0 +1,5 @@
+/terraform-provider-codigate
+/dist/
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate*

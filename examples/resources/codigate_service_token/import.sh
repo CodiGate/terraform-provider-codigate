@@ -1,0 +1,1 @@
+terraform import codigate_service_token.ci svc_0123456789abcdef

@@ -1,0 +1,1 @@
+terraform import codigate_log_destination.siem ldst_0123456789abcdef

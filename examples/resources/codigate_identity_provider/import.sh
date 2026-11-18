@@ -1,0 +1,1 @@
+terraform import codigate_identity_provider.okta idp_0123456789abcdef
