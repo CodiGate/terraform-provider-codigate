@@ -534,6 +534,14 @@ func (a *API) updateApp(x *client.App, b map[string]any) (int, any, *apiError) {
 
 func (a *API) setAccess(x *client.App, b map[string]any) (int, any, *apiError) {
 	access, _ := b["access"].(string)
+	// Like the API's "sometimes|array" rules: a key that is present must hold an array, never null.
+	for _, k := range []string{"service_tokens", "bypass_paths"} {
+		if v, ok := b[k]; ok {
+			if _, isList := v.([]any); !isList {
+				return 0, nil, invalid(k, "The "+strings.ReplaceAll(k, "_", " ")+" field must be an array.")
+			}
+		}
+	}
 	switch access {
 	case "public":
 		if !a.verifiedDomainCovers(x.Hostname) {

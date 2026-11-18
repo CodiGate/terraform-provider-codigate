@@ -201,7 +201,8 @@ func (m *appModel) fill(a *client.App) {
 // accessBody is the PUT /apps/{id}/access body for the planned access; ok is false when there is nothing to send.
 func (m *appModel) accessBody(ctx context.Context, diags *diag.Diagnostics) (client.AppAccess, bool) {
 	if m.Access.ValueString() == "public" {
-		return client.AppAccess{Access: "public"}, true
+		// The API takes absent or array service_tokens and bypass_paths, never null.
+		return client.AppAccess{Access: "public", ServiceTokens: []string{}, BypassPaths: []string{}}, true
 	}
 	if m.IdentityProviderID.IsNull() {
 		return client.AppAccess{}, false

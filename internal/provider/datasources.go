@@ -16,6 +16,7 @@ var (
 	_ datasource.DataSourceWithConfigure      = (*workspaceDataSource)(nil)
 	_ datasource.DataSourceWithValidateConfig = (*agentDataSource)(nil)
 	_ datasource.DataSourceWithValidateConfig = (*appDataSource)(nil)
+	_ datasource.DataSourceWithValidateConfig = (*identityProviderDataSource)(nil)
 )
 
 // codigate_workspace
@@ -228,4 +229,98 @@ func (d *appDataSource) Read(ctx context.Context, req datasource.ReadRequest, re
 		ServiceTokens: stringSet(a.ServiceTokens), BypassPaths: stringList(a.BypassPaths),
 		Enabled: types.BoolValue(a.Enabled), Live: types.BoolValue(a.Live), URL: types.StringValue("https://" + a.Hostname),
 	})...)
+}
+
+// codigate_identity_provider
+
+type identityProviderDataSource struct{ dataSourceBase }
+
+type identityProviderDataModel struct {
+	ID              types.String `tfsdk:"id"`
+	Name            types.String `tfsdk:"name"`
+	Type            types.String `tfsdk:"type"`
+	Issuer          types.String `tfsdk:"issuer"`
+	ClientID        types.String `tfsdk:"client_id"`
+	Scopes          types.List   `tfsdk:"scopes"`
+	GroupsClaim     types.String `tfsdk:"groups_claim"`
+	HasClientSecret types.Bool   `tfsdk:"has_client_secret"`
+	RedirectURI     types.String `tfsdk:"redirect_uri"`
+}
+
+func newIdentityProviderDataSource() datasource.DataSource { return &identityProviderDataSource{} }
+
+func (d *identityProviderDataSource) Metadata(_ context.Context, req datasource.MetadataRequest, resp *datasource.MetadataResponse) {
+	resp.TypeName = req.ProviderTypeName + "_identity_provider"
+}
+
+func (d *identityProviderDataSource) Schema(_ context.Context, _ datasource.SchemaRequest, resp *datasource.SchemaResponse) {
+	resp.Schema = schema.Schema{
+		Description: "Looks up an identity provider by id or by name, for example one made in the dashboard. The client secret is never returned.",
+		Attributes: map[string]schema.Attribute{
+			"id":                schema.StringAttribute{Optional: true, Computed: true, Description: "Identity provider id (idp_...). Set id or name."},
+			"name":              schema.StringAttribute{Optional: true, Computed: true, Description: "Identity provider name. Must match exactly one identity provider."},
+			"type":              schema.StringAttribute{Computed: true, Description: "oidc or email."},
+			"issuer":            schema.StringAttribute{Computed: true, Description: "OIDC issuer URL (null for email)."},
+			"client_id":         schema.StringAttribute{Computed: true, Description: "OIDC client id (null for email)."},
+			"scopes":            schema.ListAttribute{ElementType: types.StringType, Computed: true, Description: "Extra scopes requested besides openid, email and profile."},
+			"groups_claim":      schema.StringAttribute{Computed: true, Description: "ID token claim with the user's groups (null for email)."},
+			"has_client_secret": schema.BoolAttribute{Computed: true, Description: "Whether a client secret is stored."},
+			"redirect_uri":      schema.StringAttribute{Computed: true, Description: "Redirect URI to register at the OIDC provider (null for email)."},
+		},
+	}
+}
+
+func (d *identityProviderDataSource) ValidateConfig(ctx context.Context, req datasource.ValidateConfigRequest, resp *datasource.ValidateConfigResponse) {
+	var cfg identityProviderDataModel
+	resp.Diagnostics.Append(req.Config.Get(ctx, &cfg)...)
+	if !resp.Diagnostics.HasError() {
+		exactlyOne(cfg.ID, cfg.Name, "id", "name", &resp.Diagnostics)
+	}
+}
+
+func (d *identityProviderDataSource) Read(ctx context.Context, req datasource.ReadRequest, resp *datasource.ReadResponse) {
+	var cfg identityProviderDataModel
+	resp.Diagnostics.Append(req.Config.Get(ctx, &cfg)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	var idp *client.IdentityProvider
+	if !cfg.ID.IsNull() {
+		var err error
+		if idp, err = d.client.IdentityProvider(ctx, cfg.ID.ValueString()); err != nil {
+			apiError(&resp.Diagnostics, "read identity provider", err)
+			return
+		}
+	} else {
+		all, err := d.client.IdentityProviders(ctx)
+		if err != nil {
+			apiError(&resp.Diagnostics, "list identity providers", err)
+			return
+		}
+		for i := range all {
+			if all[i].Name == cfg.Name.ValueString() {
+				if idp != nil {
+					resp.Diagnostics.AddAttributeError(path.Root("name"), "Ambiguous identity provider name", "More than one identity provider has this name; use id.")
+					return
+				}
+				idp = &all[i]
+			}
+		}
+		if idp == nil {
+			resp.Diagnostics.AddAttributeError(path.Root("name"), "Identity provider not found", fmt.Sprintf("No identity provider is named %q.", cfg.Name.ValueString()))
+			return
+		}
+	}
+	m := identityProviderDataModel{
+		ID: types.StringValue(idp.ID), Name: types.StringValue(idp.Name), Type: types.StringValue(idp.Type),
+		HasClientSecret: types.BoolValue(idp.HasClientSecret),
+		Issuer:          types.StringNull(), ClientID: types.StringNull(), GroupsClaim: types.StringNull(), RedirectURI: types.StringNull(),
+		Scopes: types.ListNull(types.StringType),
+	}
+	if idp.Type != "email" {
+		m.Issuer, m.ClientID = types.StringValue(idp.Issuer), types.StringValue(idp.ClientID)
+		m.GroupsClaim, m.RedirectURI = types.StringValue(idp.GroupsClaim), types.StringValue(idp.RedirectURI)
+		m.Scopes = stringList(idp.Scopes)
+	}
+	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
 }

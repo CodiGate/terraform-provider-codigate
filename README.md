@@ -53,7 +53,7 @@ Create an API token (`cgk_...`) in the dashboard. An **admin** token can plan an
 | `codigate_log_destination` | log destination id |
 | `codigate_workspace_branding` | `workspace` |
 
-Data sources: `codigate_workspace`, `codigate_agent` (by id or name), `codigate_app` (by id or hostname).
+Data sources: `codigate_workspace`, `codigate_agent` (by id or name), `codigate_app` (by id or hostname), `codigate_identity_provider` (by id or name; never the client secret).
 
 Things to know:
 

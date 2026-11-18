@@ -105,5 +105,6 @@ func (p *codigateProvider) DataSources(context.Context) []func() datasource.Data
 		newWorkspaceDataSource,
 		newAgentDataSource,
 		newAppDataSource,
+		newIdentityProviderDataSource,
 	}
 }

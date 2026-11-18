@@ -365,6 +365,14 @@ type IdentityProvider struct {
 	RedirectURI     string   `json:"redirect_uri"`
 }
 
+func (c *Client) IdentityProviders(ctx context.Context) ([]IdentityProvider, error) {
+	l, err := get[[]IdentityProvider](ctx, c, "/identity-providers")
+	if err != nil {
+		return nil, err
+	}
+	return *l, nil
+}
+
 func (c *Client) IdentityProvider(ctx context.Context, id string) (*IdentityProvider, error) {
 	return get[IdentityProvider](ctx, c, p("/identity-providers/%s", id))
 }

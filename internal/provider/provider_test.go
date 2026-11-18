@@ -636,6 +636,68 @@ resource "codigate_identity_provider" "mail" {
 	})
 }
 
+func TestIdentityProviderDataSource(t *testing.T) {
+	_, p := fake(t)
+	resources := `
+resource "codigate_identity_provider" "okta" {
+  name          = "Okta"
+  issuer        = "https://acme.okta.com"
+  client_id     = "0oa123"
+  client_secret = "s3cret"
+  scopes        = ["groups"]
+}
+resource "codigate_identity_provider" "mail" {
+  name = "Email code"
+  type = "email"
+}
+`
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: factories,
+		Steps: []resource.TestStep{
+			{Config: p + resources},
+			{
+				Config: p + resources + `
+data "codigate_identity_provider" "byname" {
+  name = "Okta"
+}
+data "codigate_identity_provider" "byid" {
+  id = codigate_identity_provider.mail.id
+}`,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttrPair("data.codigate_identity_provider.byname", "id", "codigate_identity_provider.okta", "id"),
+					resource.TestCheckResourceAttr("data.codigate_identity_provider.byname", "type", "oidc"),
+					resource.TestCheckResourceAttr("data.codigate_identity_provider.byname", "issuer", "https://acme.okta.com"),
+					resource.TestCheckResourceAttr("data.codigate_identity_provider.byname", "client_id", "0oa123"),
+					resource.TestCheckResourceAttr("data.codigate_identity_provider.byname", "scopes.#", "1"),
+					resource.TestCheckResourceAttr("data.codigate_identity_provider.byname", "scopes.0", "groups"),
+					resource.TestCheckResourceAttr("data.codigate_identity_provider.byname", "groups_claim", "groups"),
+					resource.TestCheckResourceAttr("data.codigate_identity_provider.byname", "has_client_secret", "true"),
+					resource.TestMatchResourceAttr("data.codigate_identity_provider.byname", "redirect_uri", matches(`/oidc/callback$`)),
+					resource.TestCheckNoResourceAttr("data.codigate_identity_provider.byname", "client_secret"),
+					resource.TestCheckResourceAttr("data.codigate_identity_provider.byid", "name", "Email code"),
+					resource.TestCheckResourceAttr("data.codigate_identity_provider.byid", "type", "email"),
+					resource.TestCheckNoResourceAttr("data.codigate_identity_provider.byid", "issuer"),
+					resource.TestCheckNoResourceAttr("data.codigate_identity_provider.byid", "redirect_uri"),
+					resource.TestCheckResourceAttr("data.codigate_identity_provider.byid", "has_client_secret", "false"),
+				),
+			},
+			{
+				Config: p + resources + `
+resource "codigate_identity_provider" "okta2" {
+  name      = "Okta"
+  issuer    = "https://other.okta.com"
+  client_id = "0oa999"
+}
+data "codigate_identity_provider" "byname" {
+  name       = "Okta"
+  depends_on = [codigate_identity_provider.okta2]
+}`,
+				ExpectError: matches(`Ambiguous identity provider name`),
+			},
+		},
+	})
+}
+
 func TestDomainResource(t *testing.T) {
 	api, p := fake(t)
 	var last *terraform.State
@@ -932,6 +994,18 @@ func TestDataSourcesNotFound(t *testing.T) {
 			{
 				Config:      p + `data "codigate_agent" "x" { name = "nope" }`,
 				ExpectError: matches(`(?i)no agent`),
+			},
+			{
+				Config:      p + `data "codigate_identity_provider" "x" { name = "nope" }`,
+				ExpectError: matches(`(?i)no identity provider`),
+			},
+			{
+				Config:      p + `data "codigate_identity_provider" "x" { id = "idp_nope" }`,
+				ExpectError: matches(`(?i)not found|404`),
+			},
+			{
+				Config:      p + `data "codigate_identity_provider" "x" {}`,
+				ExpectError: matches(`Set exactly one of id and name`),
 			},
 		},
 	})
