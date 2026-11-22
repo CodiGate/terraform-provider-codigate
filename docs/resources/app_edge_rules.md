@@ -30,10 +30,16 @@ resource "codigate_app_edge_rules" "wiki" {
   challenge = {
     mode            = "auto"
     auto_per_minute = 120
+    # API clients and webhooks can't solve a browser challenge.
+    skip_paths = ["/api/", "/webhooks/stripe"]
   }
   waf = {
     mode       = "block"
     exclusions = [942100]
+    # Switch off a CRS rule on one path only, for example where a search box takes SQL-looking text.
+    path_exclusions = [
+      { path = "/api/search", rules = [942100, 942200] },
+    ]
   }
 }
 ```
@@ -89,6 +95,7 @@ Optional:
 - `auto_per_minute` (Number) Requests per minute that turn the challenge on (mode auto only, 10-1000000).
 - `cookie_minutes` (Number) How long a solved challenge lasts (5-1440 minutes). Defaults to 30.
 - `difficulty` (String) low, medium or high. Defaults to medium.
+- `skip_paths` (Set of String) Path prefixes where no challenge is shown, for example /api/ or /webhooks/ (lowercase, not /, at most 50). Other edge rules, the WAF and the app's access settings still apply there.
 
 
 <a id="nestedatt--path_rules"></a>
@@ -109,7 +116,16 @@ Required:
 
 Optional:
 
-- `exclusions` (Set of Number) CRS rule ids to skip, for example 942100 (at most 100).
+- `exclusions` (Set of Number) CRS rule ids to skip on the whole app, for example 942100 (at most 100).
+- `path_exclusions` (Attributes List) CRS attack rules to skip only under a path prefix, for example rule 942100 under /api/search (at most 50 paths, each path once). (see [below for nested schema](#nestedatt--waf--path_exclusions))
+
+<a id="nestedatt--waf--path_exclusions"></a>
+### Nested Schema for `waf.path_exclusions`
+
+Required:
+
+- `path` (String) Lowercase path prefix, not /.
+- `rules` (Set of Number) CRS attack rule ids (910000-948999) to skip under the path, 1 to 20.
 
 ## Import
 

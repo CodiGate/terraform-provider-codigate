@@ -350,6 +350,9 @@ data "codigate_agent" "byname" {
 					resource.TestCheckResourceAttrPair("data.codigate_app.wiki", "id", "codigate_app.wiki", "id"),
 					resource.TestCheckResourceAttr("data.codigate_app.wiki", "enabled", "false"),
 					resource.TestCheckResourceAttr("data.codigate_app.wiki", "live", "false"),
+					resource.TestCheckResourceAttr("data.codigate_app.wiki", "not_live_reason", "switched off"),
+					resource.TestCheckResourceAttr("data.codigate_app.wiki", "agent_connected", "false"),
+					resource.TestCheckResourceAttrSet("data.codigate_app.wiki", "created_at"),
 					resource.TestCheckResourceAttr("data.codigate_app.wiki", "access", "protected"),
 					resource.TestCheckResourceAttr("data.codigate_app.wiki", "url", "https://wiki.acme.codigate.app"),
 					resource.TestCheckResourceAttrPair("data.codigate_agent.byname", "id", "codigate_agent.a", "id"),
@@ -483,10 +486,15 @@ resource "codigate_app_edge_rules" "x" {
   challenge = {
     mode            = "auto"
     auto_per_minute = 120
+    skip_paths      = ["/api/", "/webhooks/stripe"]
   }
   waf = {
     mode       = "block"
     exclusions = [942100]
+    path_exclusions = [
+      { path = "/api/search", rules = [942100, 941100] },
+      { path = "/cms/", rules = [932100] },
+    ]
   }
 }`
 	var last *terraform.State
@@ -506,6 +514,12 @@ resource "codigate_app_edge_rules" "x" {
 					resource.TestCheckResourceAttr("codigate_app_edge_rules.x", "challenge.cookie_minutes", "30"),
 					resource.TestCheckResourceAttr("codigate_app_edge_rules.x", "waf.mode", "block"),
 					resource.TestCheckTypeSetElemAttr("codigate_app_edge_rules.x", "waf.exclusions.*", "942100"),
+					resource.TestCheckResourceAttr("codigate_app_edge_rules.x", "challenge.skip_paths.#", "2"),
+					resource.TestCheckTypeSetElemAttr("codigate_app_edge_rules.x", "challenge.skip_paths.*", "/webhooks/stripe"),
+					resource.TestCheckResourceAttr("codigate_app_edge_rules.x", "waf.path_exclusions.#", "2"),
+					resource.TestCheckResourceAttr("codigate_app_edge_rules.x", "waf.path_exclusions.0.path", "/api/search"),
+					resource.TestCheckTypeSetElemAttr("codigate_app_edge_rules.x", "waf.path_exclusions.0.rules.*", "941100"),
+					resource.TestCheckResourceAttr("codigate_app_edge_rules.x", "waf.path_exclusions.1.rules.#", "1"),
 					resource.TestCheckResourceAttr("codigate_app_edge_rules.x", "advanced_allowed", "true"),
 					stateCapture(&last),
 				),
@@ -556,6 +570,93 @@ resource "codigate_app_edge_rules" "x" {
 }`,
 				PlanOnly:           true,
 				ExpectNonEmptyPlan: true,
+			},
+		},
+	})
+}
+
+// The path-scoped parts (P2-32) give no drift whether they are left out, set to [] or filled in,
+// and the API's limits are checked at plan time.
+func TestEdgeRulesPathScopes(t *testing.T) {
+	_, p := fake(t)
+	base := p + `
+resource "codigate_agent" "a" { name = "a" }
+resource "codigate_app" "x" {
+  name     = "X"
+  hostname = "x.acme.codigate.app"
+  agent_id = codigate_agent.a.id
+}
+`
+	rules := func(challenge, waf string) string {
+		return base + `
+resource "codigate_app_edge_rules" "x" {
+  app_id    = codigate_app.x.id
+  challenge = {
+    mode = "on"
+` + challenge + `
+  }
+  waf = {
+    mode = "detect"
+` + waf + `
+  }
+}`
+	}
+	empty := resource.ConfigPlanChecks{PostApplyPostRefresh: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()}}
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: factories,
+		Steps: []resource.TestStep{
+			{
+				Config:           rules("", ""),
+				ConfigPlanChecks: empty,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr("codigate_app_edge_rules.x", "challenge.skip_paths"),
+					resource.TestCheckNoResourceAttr("codigate_app_edge_rules.x", "waf.path_exclusions"),
+				),
+			},
+			{
+				Config:           rules("skip_paths = []", "path_exclusions = []"),
+				ConfigPlanChecks: empty,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("codigate_app_edge_rules.x", "challenge.skip_paths.#", "0"),
+					resource.TestCheckResourceAttr("codigate_app_edge_rules.x", "waf.path_exclusions.#", "0"),
+				),
+			},
+			{
+				Config:           rules(`skip_paths = ["/api/"]`, `path_exclusions = [{ path = "/upload", rules = [920420] }]`),
+				ConfigPlanChecks: empty,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("codigate_app_edge_rules.x", "challenge.skip_paths.#", "1"),
+					resource.TestCheckResourceAttr("codigate_app_edge_rules.x", "waf.path_exclusions.0.path", "/upload"),
+				),
+			},
+			{
+				ResourceName:      "codigate_app_edge_rules.x",
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+			{
+				// Leaving them out again clears them.
+				Config:           rules("", ""),
+				ConfigPlanChecks: empty,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr("codigate_app_edge_rules.x", "challenge.skip_paths"),
+					resource.TestCheckNoResourceAttr("codigate_app_edge_rules.x", "waf.path_exclusions"),
+				),
+			},
+			{Config: rules(`skip_paths = ["/API/"]`, ""), ExpectError: matches(`stores paths lowercase`)},
+			{Config: rules(`skip_paths = ["/"]`, ""), ExpectError: matches(`covers the whole app`)},
+			{Config: rules(`skip_paths = ["/a/../b"]`, ""), ExpectError: matches(`not a valid path`)},
+			{Config: rules("", `path_exclusions = [{ path = "/api", rules = [200002] }]`), ExpectError: matches(`CRS attack rule`)},
+			{Config: rules("", `path_exclusions = [{ path = "/api", rules = [] }]`), ExpectError: matches(`Must have 1 to 20 items`)},
+			{
+				Config:      rules("", `path_exclusions = [{ path = "/api", rules = [942100] }, { path = "/api", rules = [941100] }]`),
+				ExpectError: matches(`Duplicate path`),
+			},
+			{Config: rules("", `exclusions = [0]`), ExpectError: matches(`Invalid rule id`)},
+			{
+				// Destroy runs with the last config, so end on a valid one.
+				Config:           rules(`skip_paths = ["/api/"]`, ""),
+				ConfigPlanChecks: empty,
 			},
 		},
 	})
@@ -977,6 +1078,129 @@ resource "codigate_workspace_branding" "this" {
 }`,
 				PlanOnly:           true,
 				ExpectNonEmptyPlan: true,
+			},
+		},
+	})
+}
+
+func TestAlertsResource(t *testing.T) {
+	api, p := fake(t)
+	const res = "codigate_workspace_alerts.this"
+	cfg := func(body string) string {
+		return p + "\nresource \"codigate_workspace_alerts\" \"this\" {\n" + body + "\n}"
+	}
+	var secret string
+	keep := func(v string) error { secret = v; return nil }
+	same := func(v string) error {
+		if v != secret {
+			return fmt.Errorf("signing_secret changed from %q to %q", secret, v)
+		}
+		return nil
+	}
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: factories,
+		CheckDestroy: func(*terraform.State) error {
+			if a := api.Alerts(); a.WebhookURL != nil || a.NtfyURL != nil || a.HasSecret {
+				return fmt.Errorf("alert channels not off after destroy: %+v", a)
+			}
+			return nil
+		},
+		Steps: []resource.TestStep{
+			{
+				// Nothing set: the resource exists with both channels off.
+				Config: cfg(""),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(res, "id", "workspace"),
+					resource.TestCheckResourceAttr(res, "allowed", "true"),
+					resource.TestCheckResourceAttr(res, "has_secret", "false"),
+					resource.TestCheckNoResourceAttr(res, "webhook_url"),
+					resource.TestCheckNoResourceAttr(res, "signing_secret"),
+				),
+			},
+			{
+				Config: cfg(`  webhook_url = "https://hooks.example.com/codigate"
+  ntfy_url    = "https://ntfy.sh/acme-alerts"`),
+				ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{
+					plancheck.ExpectUnknownValue(res, tfjsonpath.New("signing_secret")),
+					plancheck.ExpectKnownValue(res, tfjsonpath.New("has_secret"), knownvalue.Bool(true)),
+				}},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(res, "webhook_url", "https://hooks.example.com/codigate"),
+					resource.TestCheckResourceAttr(res, "ntfy_url", "https://ntfy.sh/acme-alerts"),
+					resource.TestCheckResourceAttr(res, "has_secret", "true"),
+					resource.TestMatchResourceAttr(res, "signing_secret", matches(`^whsec_`)),
+					resource.TestCheckResourceAttrWith(res, "signing_secret", keep),
+				),
+			},
+			{
+				// The API never returns the secret again.
+				ResourceName:            res,
+				ImportState:             true,
+				ImportStateId:           "workspace",
+				ImportStateVerify:       true,
+				ImportStateVerifyIgnore: []string{"signing_secret"},
+			},
+			{
+				ResourceName:  res,
+				ImportState:   true,
+				ImportStateId: "nope",
+				ExpectError:   matches(`Unexpected import id`),
+			},
+			{
+				// A new webhook URL keeps the secret; dropping ntfy turns it off.
+				Config: cfg(`  webhook_url = "https://hooks.example.com/other"`),
+				ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{
+					plancheck.ExpectKnownValue(res, tfjsonpath.New("has_secret"), knownvalue.Bool(true)),
+				}},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(res, "webhook_url", "https://hooks.example.com/other"),
+					resource.TestCheckNoResourceAttr(res, "ntfy_url"),
+					resource.TestCheckResourceAttrWith(res, "signing_secret", same),
+				),
+			},
+			{
+				// Channels turned off in the dashboard: Terraform puts them back.
+				PreConfig:          func() { api.Remove("alerts") },
+				Config:             cfg(`  webhook_url = "https://hooks.example.com/other"`),
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				// Re-adding the webhook makes a new secret.
+				Config: cfg(`  webhook_url = "https://hooks.example.com/other"`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(res, "has_secret", "true"),
+					resource.TestCheckResourceAttrWith(res, "signing_secret", func(v string) error {
+						if v == "" || v == secret {
+							return fmt.Errorf("expected a new signing secret, got %q", v)
+						}
+						return nil
+					}),
+				),
+			},
+			{
+				// No webhook: no secret.
+				Config: cfg(`  ntfy_url = "https://ntfy.sh/acme-alerts"`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(res, "webhook_url"),
+					resource.TestCheckResourceAttr(res, "has_secret", "false"),
+					resource.TestCheckNoResourceAttr(res, "signing_secret"),
+				),
+			},
+			{Config: cfg(`  webhook_url = "http://hooks.example.com"`), ExpectError: matches(`https:// URL`)},
+			{Config: cfg(`  ntfy_url = ""`), ExpectError: matches(`leave the attribute out`)},
+			{Config: cfg(`  ntfy_url = " https://ntfy.sh/x"`), ExpectError: matches(`spaces`)},
+			{Config: cfg(fmt.Sprintf(`  webhook_url = "https://example.com/%s"`, strings.Repeat("a", 1990))), ExpectError: matches(`at most 2000`)},
+			{
+				// A plan without alert channels refuses new ones (Free plan).
+				PreConfig:   func() { api.AlertsBlocked = true },
+				Config:      cfg(`  ntfy_url = "https://ntfy.sh/other"`),
+				ExpectError: matches(`Starter plan`),
+			},
+			{
+				// Removing channels works on every plan; destroy runs with this config.
+				Config: cfg(""),
+				Check:  resource.TestCheckResourceAttr(res, "allowed", "false"),
 			},
 		},
 	})

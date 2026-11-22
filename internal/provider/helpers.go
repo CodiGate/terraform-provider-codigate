@@ -313,3 +313,78 @@ func (v int64Range) ValidateInt64(ctx context.Context, req validator.Int64Reques
 		resp.Diagnostics.AddAttributeError(req.Path, "Value out of range", fmt.Sprintf("Must be %s, got %d.", v.Description(ctx), n))
 	}
 }
+
+// scopePathMsg checks a path of a path-scoped rule as the API does, in the lowercase form it stores.
+func scopePathMsg(s string) string {
+	if s == "/" {
+		return `"/" covers the whole app: use the app-wide setting instead.`
+	}
+	if s != strings.ToLower(s) {
+		return fmt.Sprintf("Write %q as %q: the API stores paths lowercase.", s, strings.ToLower(s))
+	}
+	if !client.IsScopePath(s) {
+		return fmt.Sprintf("%q is not a valid path: start with /, no . or .. segments, no //, and only letters, digits and - . _ ~ / ! $ & ( ) + , = : @.", s)
+	}
+	return ""
+}
+
+var scopePath = stringCheck{desc: "a lowercase path prefix other than /", check: scopePathMsg}
+
+var scopePathSet = setCheck{desc: "lowercase path prefixes other than /", check: scopePathMsg}
+
+// setSize limits the number of elements in a set.
+type setSize struct{ min, max int }
+
+func (v setSize) Description(context.Context) string {
+	return fmt.Sprintf("%d to %d items", v.min, v.max)
+}
+func (v setSize) MarkdownDescription(ctx context.Context) string { return v.Description(ctx) }
+func (v setSize) ValidateSet(ctx context.Context, req validator.SetRequest, resp *validator.SetResponse) {
+	if req.ConfigValue.IsNull() || req.ConfigValue.IsUnknown() {
+		return
+	}
+	if n := len(req.ConfigValue.Elements()); n < v.min || n > v.max {
+		resp.Diagnostics.AddAttributeError(req.Path, "Wrong number of items", fmt.Sprintf("Must have %s, got %d.", v.Description(ctx), n))
+	}
+}
+
+// listSize limits the number of elements in a list.
+type listSize struct{ max int }
+
+func (v listSize) Description(context.Context) string {
+	return fmt.Sprintf("at most %d items", v.max)
+}
+func (v listSize) MarkdownDescription(ctx context.Context) string { return v.Description(ctx) }
+func (v listSize) ValidateList(ctx context.Context, req validator.ListRequest, resp *validator.ListResponse) {
+	if req.ConfigValue.IsNull() || req.ConfigValue.IsUnknown() {
+		return
+	}
+	if n := len(req.ConfigValue.Elements()); n > v.max {
+		resp.Diagnostics.AddAttributeError(req.Path, "Too many items", fmt.Sprintf("Must have %s, got %d.", v.Description(ctx), n))
+	}
+}
+
+// int64SetRange checks every known number in a set.
+type int64SetRange struct {
+	min, max int64
+	hint     string
+}
+
+func (v int64SetRange) Description(context.Context) string {
+	return fmt.Sprintf("numbers from %d to %d", v.min, v.max)
+}
+func (v int64SetRange) MarkdownDescription(ctx context.Context) string { return v.Description(ctx) }
+func (v int64SetRange) ValidateSet(ctx context.Context, req validator.SetRequest, resp *validator.SetResponse) {
+	if req.ConfigValue.IsNull() || req.ConfigValue.IsUnknown() {
+		return
+	}
+	for _, e := range req.ConfigValue.Elements() {
+		n, ok := e.(types.Int64)
+		if !ok || n.IsNull() || n.IsUnknown() {
+			continue
+		}
+		if x := n.ValueInt64(); x < v.min || x > v.max {
+			resp.Diagnostics.AddAttributeError(req.Path, "Invalid rule id", fmt.Sprintf("%d is outside %d to %d%s.", x, v.min, v.max, v.hint))
+		}
+	}
+}

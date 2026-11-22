@@ -1,0 +1,1 @@
+terraform import codigate_workspace_alerts.this workspace

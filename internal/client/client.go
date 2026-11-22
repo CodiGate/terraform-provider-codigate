@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -317,11 +318,53 @@ type Challenge struct {
 	Difficulty    string `json:"difficulty"`
 	CookieMinutes int64  `json:"cookie_minutes"`
 	AutoPerMinute *int64 `json:"auto_per_minute"`
+	// SkipPaths are path prefixes where the challenge is not shown (P2-32).
+	SkipPaths []string `json:"skip_paths"`
+}
+
+// WafPathExclusion skips CRS attack rules only under one path prefix (P2-32).
+type WafPathExclusion struct {
+	Path  string  `json:"path"`
+	Rules []int64 `json:"rules"`
 }
 
 type Waf struct {
-	Mode       string  `json:"mode"`
-	Exclusions []int64 `json:"exclusions"`
+	Mode           string             `json:"mode"`
+	Exclusions     []int64            `json:"exclusions"`
+	PathExclusions []WafPathExclusion `json:"path_exclusions"`
+}
+
+// Limits of the edge rules API (control-plane EdgeRules).
+const (
+	MaxWafExclusions     = 100
+	MaxWafRuleID         = 999999
+	MaxWafPathExclusions = 50
+	MaxWafPathRules      = 20
+	MinWafAttackRule     = 910000
+	MaxWafAttackRule     = 948999
+	MaxChallengeSkipPath = 50
+)
+
+var scopePathChars = regexp.MustCompile(`^[A-Za-z0-9\-._~/!$&()+,=:@]+$`)
+
+// IsScopePath matches the API's check for a path of a path-scoped rule (challenge.skip_paths,
+// waf.path_exclusions): a bypass-style path other than "/", made of plain path characters only.
+// It does not lowercase; the API stores these paths lowercase.
+func IsScopePath(p string) bool {
+	if p == "/" || len(p) < 2 || len(p) > 256 || p[0] != '/' || strings.ContainsAny(p, "?#%;\\*") ||
+		strings.HasPrefix(p, "/.codigate") || !scopePathChars.MatchString(p) {
+		return false
+	}
+	t := strings.TrimRight(p, "/")
+	if t == "" {
+		return false
+	}
+	for _, s := range strings.Split(t[1:], "/") {
+		if s == "" || s == "." || s == ".." {
+			return false
+		}
+	}
+	return true
 }
 
 // EdgeRules is both the PUT body and the "rules" part of GET /apps/{id}/edge-rules.
@@ -513,4 +556,35 @@ func (c *Client) SetBranding(ctx context.Context, body map[string]any) (*Brandin
 
 func (c *Client) DeleteBranding(ctx context.Context) error {
 	return c.Do(ctx, http.MethodDelete, "/workspace/branding", nil, nil)
+}
+
+// Alerts is GET /workspace/alerts (not wrapped in data): the extra channels for origin health
+// alerts. SigningSecret is only returned by the PUT that creates it.
+type Alerts struct {
+	Allowed       bool    `json:"allowed"`
+	WebhookURL    *string `json:"webhook_url"`
+	HasSecret     bool    `json:"has_secret"`
+	NtfyURL       *string `json:"ntfy_url"`
+	SigningSecret *string `json:"signing_secret,omitempty"`
+}
+
+// AlertURLMax is the API's limit on webhook_url and ntfy_url.
+const AlertURLMax = 2000
+
+func (c *Client) Alerts(ctx context.Context) (*Alerts, error) {
+	var a Alerts
+	if err := c.Do(ctx, http.MethodGet, "/workspace/alerts", nil, &a); err != nil {
+		return nil, err
+	}
+	return &a, nil
+}
+
+// SetAlerts sends both URLs; nil clears a channel.
+func (c *Client) SetAlerts(ctx context.Context, webhookURL, ntfyURL *string) (*Alerts, error) {
+	var a Alerts
+	body := map[string]any{"webhook_url": webhookURL, "ntfy_url": ntfyURL}
+	if err := c.Do(ctx, http.MethodPut, "/workspace/alerts", body, &a); err != nil {
+		return nil, err
+	}
+	return &a, nil
 }

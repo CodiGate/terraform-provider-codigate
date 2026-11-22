@@ -40,7 +40,14 @@ type API struct {
 	tokens   map[string]*client.ServiceToken
 	logs     map[string]*logDest
 	branding client.Branding
-	requests []string
+	alerts   alerts
+	// AlertsBlocked makes the workspace's plan refuse new alert channels, like the Free plan.
+	AlertsBlocked bool
+	requests      []string
+}
+
+type alerts struct {
+	webhook, ntfy, secret *string
 }
 
 type idp struct {
@@ -74,12 +81,16 @@ func (a *API) Requests() []string {
 }
 
 // Remove deletes an object by id behind Terraform's back, to simulate drift. The id
-// "branding" resets the workspace branding.
+// "branding" resets the workspace branding, "alerts" turns the alert channels off.
 func (a *API) Remove(id string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if id == "branding" {
 		a.branding.Accent, a.branding.Logo = nil, nil
+		return
+	}
+	if id == "alerts" {
+		a.alerts = alerts{}
 		return
 	}
 	delete(a.agents, id)
@@ -235,6 +246,9 @@ func (a *API) route(method string, seg []string, b map[string]any) (int, any, *a
 			if id == "branding" {
 				return a.brandingRoute(method, b)
 			}
+			if id == "alerts" && method != "DELETE" {
+				return a.alertsRoute(method, b)
+			}
 		case "GET agents", "PATCH agents", "DELETE agents":
 			ag, ok := a.agents[id]
 			if !ok {
@@ -356,6 +370,9 @@ func (a *API) route(method string, seg []string, b map[string]any) (int, any, *a
 				raw, _ := json.Marshal(b)
 				if err := json.Unmarshal(raw, &rules); err != nil {
 					return 0, nil, invalid("rules", "Invalid edge rules.")
+				}
+				if e := normalizeEdgeRules(&rules); e != nil {
+					return 0, nil, e
 				}
 				a.edge[id] = rules
 			}
@@ -655,6 +672,14 @@ func (a *API) edgeView(appID string) client.EdgeRulesView {
 	if r.Waf.Exclusions == nil {
 		r.Waf.Exclusions = []int64{}
 	}
+	if r.Waf.PathExclusions == nil {
+		r.Waf.PathExclusions = []client.WafPathExclusion{}
+	}
+	if r.Challenge != nil && r.Challenge.SkipPaths == nil {
+		c := *r.Challenge
+		c.SkipPaths = []string{}
+		r.Challenge = &c
+	}
 	return client.EdgeRulesView{AppID: appID, Rules: r, AdvancedAllowed: true, Inactive: []string{}}
 }
 
@@ -938,4 +963,155 @@ func (a *API) brandingRoute(method string, b map[string]any) (int, any, *apiErro
 	return 200, a.branding, nil
 }
 
+func (a *API) alertsView(secret *string) client.Alerts {
+	return client.Alerts{Allowed: !a.AlertsBlocked, WebhookURL: a.alerts.webhook, HasSecret: a.alerts.secret != nil, NtfyURL: a.alerts.ntfy, SigningSecret: secret}
+}
+
+// alertsRoute mirrors SetAlertChannels: both URLs must be present, "" or null clears a channel,
+// URLs are trimmed, a new webhook gets a signing secret that is returned once.
+func (a *API) alertsRoute(method string, b map[string]any) (int, any, *apiError) {
+	if method == "GET" {
+		return 200, a.alertsView(nil), nil
+	}
+	urls := map[string]*string{}
+	for _, f := range []string{"webhook_url", "ntfy_url"} {
+		v, ok := b[f]
+		if !ok {
+			return 0, nil, invalid(f, "The "+f+" field must be present.")
+		}
+		if v == nil {
+			urls[f] = nil
+			continue
+		}
+		s, isStr := v.(string)
+		if !isStr {
+			return 0, nil, invalid(f, "The "+f+" field must be a string.")
+		}
+		if s = strings.TrimSpace(s); s == "" {
+			urls[f] = nil
+			continue
+		}
+		if len(s) > client.AlertURLMax || !strings.HasPrefix(s, "https://") || strings.ContainsAny(s, " \t") {
+			return 0, nil, invalid(f, "The "+f+" field must be a valid URL.")
+		}
+		urls[f] = &s
+	}
+	wh, nt := urls["webhook_url"], urls["ntfy_url"]
+	same := func(x, y *string) bool { return (x == nil && y == nil) || (x != nil && y != nil && *x == *y) }
+	adding := (wh != nil && !same(wh, a.alerts.webhook)) || (nt != nil && !same(nt, a.alerts.ntfy))
+	if adding && a.AlertsBlocked {
+		return 0, nil, invalid("alerts", "Webhook and ntfy alerts need the Starter plan or higher.")
+	}
+	var secret *string
+	a.alerts.webhook, a.alerts.ntfy = wh, nt
+	if wh == nil {
+		a.alerts.secret = nil
+	} else if a.alerts.secret == nil {
+		secret = ptr(a.secret("whsec_"))
+		a.alerts.secret = secret
+	}
+	return 200, a.alertsView(secret), nil
+}
+
 var authHeaderRe = regexp.MustCompile(`^[A-Za-z0-9-]+:[ \t]*\S[^\r\n]*$`)
+
+// normalizeEdgeRules applies the API's checks and rewrites (control-plane EdgeRules) to the parts
+// the provider shapes itself: challenge.skip_paths and the WAF rule lists. Like the API, empty
+// lists are stored as absent.
+func normalizeEdgeRules(r *client.EdgeRules) *apiError {
+	if c := r.Challenge; c != nil {
+		if c.Mode == "off" {
+			r.Challenge = nil
+		} else {
+			var out []string
+			seen := map[string]bool{}
+			for _, p := range c.SkipPaths {
+				p = strings.ToLower(p)
+				if seen[p] {
+					continue
+				}
+				if !client.IsScopePath(p) {
+					return invalid("challenge.skip_paths", fmt.Sprintf("%q is not a valid path.", p))
+				}
+				seen[p] = true
+				out = append(out, p)
+			}
+			if len(out) > client.MaxChallengeSkipPath {
+				return invalid("challenge.skip_paths", "At most 50 paths.")
+			}
+			c.SkipPaths = out
+		}
+	}
+	w := r.Waf
+	if w == nil {
+		return nil
+	}
+	if w.Mode == "off" || w.Mode == "" {
+		r.Waf = nil
+		return nil
+	}
+	ids := map[int64]bool{}
+	var excl []int64
+	for _, n := range w.Exclusions {
+		if n < 1 || n > client.MaxWafRuleID {
+			return invalid("waf.exclusions", fmt.Sprintf("%d is not a rule id.", n))
+		}
+		if !ids[n] {
+			ids[n] = true
+			excl = append(excl, n)
+		}
+	}
+	if len(excl) > client.MaxWafExclusions {
+		return invalid("waf.exclusions", "At most 100 excluded rules.")
+	}
+	sort.Slice(excl, func(i, j int) bool { return excl[i] < excl[j] })
+	w.Exclusions = excl
+	var order []string
+	byPath := map[string]map[int64]bool{}
+	for _, e := range w.PathExclusions {
+		p := strings.ToLower(strings.TrimSpace(e.Path))
+		if p == "" && len(e.Rules) == 0 {
+			continue
+		}
+		if !client.IsScopePath(p) {
+			return invalid("waf.path_exclusions", fmt.Sprintf("%q is not a valid path.", p))
+		}
+		if byPath[p] == nil {
+			byPath[p] = map[int64]bool{}
+			order = append(order, p)
+		}
+		for _, n := range e.Rules {
+			if n < client.MinWafAttackRule || n > client.MaxWafAttackRule {
+				return invalid("waf.path_exclusions", fmt.Sprintf("%d is not an attack rule id.", n))
+			}
+			byPath[p][n] = true
+		}
+	}
+	var paths []client.WafPathExclusion
+	for _, p := range order {
+		if len(byPath[p]) == 0 {
+			continue
+		}
+		if len(byPath[p]) > client.MaxWafPathRules {
+			return invalid("waf.path_exclusions", fmt.Sprintf("At most 20 rules for %q.", p))
+		}
+		rules := make([]int64, 0, len(byPath[p]))
+		for n := range byPath[p] {
+			rules = append(rules, n)
+		}
+		sort.Slice(rules, func(i, j int) bool { return rules[i] < rules[j] })
+		paths = append(paths, client.WafPathExclusion{Path: p, Rules: rules})
+	}
+	if len(paths) > client.MaxWafPathExclusions {
+		return invalid("waf.path_exclusions", "At most 50 paths with exclusions.")
+	}
+	w.PathExclusions = paths
+	return nil
+}
+
+// Alerts returns the workspace's alert channels as GET /workspace/alerts would.
+func (a *API) Alerts() client.Alerts {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.alertsView(nil)
+}

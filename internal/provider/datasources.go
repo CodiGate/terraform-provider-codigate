@@ -170,6 +170,9 @@ type appDataModel struct {
 	BypassPaths   types.List   `tfsdk:"bypass_paths"`
 	Enabled       types.Bool   `tfsdk:"enabled"`
 	Live          types.Bool   `tfsdk:"live"`
+	NotLiveReason types.String `tfsdk:"not_live_reason"`
+	AgentOnline   types.Bool   `tfsdk:"agent_connected"`
+	CreatedAt     types.String `tfsdk:"created_at"`
 	URL           types.String `tfsdk:"url"`
 }
 
@@ -193,6 +196,9 @@ func (d *appDataSource) Schema(_ context.Context, _ datasource.SchemaRequest, re
 			"bypass_paths":         schema.ListAttribute{ElementType: types.StringType, Computed: true, Description: "Paths that skip the login."},
 			"enabled":              schema.BoolAttribute{Computed: true, Description: "Whether the app is enabled."},
 			"live":                 schema.BoolAttribute{Computed: true, Description: "Whether the app serves traffic now."},
+			"not_live_reason":      schema.StringAttribute{Computed: true, Description: "Why the app is not live (for example `needs a verified domain`), null when live."},
+			"agent_connected":      schema.BoolAttribute{Computed: true, Description: "Whether the app's agent is connected now."},
+			"created_at":           schema.StringAttribute{Computed: true, Description: "When the app was created (RFC 3339)."},
 			"url":                  schema.StringAttribute{Computed: true, Description: "https:// URL of the app."},
 		},
 	}
@@ -227,7 +233,8 @@ func (d *appDataSource) Read(ctx context.Context, req datasource.ReadRequest, re
 		ID: types.StringValue(a.ID), Hostname: types.StringValue(a.Hostname), Name: types.StringValue(a.Name),
 		AgentID: strPtrValue(a.AgentID), Access: types.StringValue(a.Access), IdpID: strPtrValue(a.IdpID),
 		ServiceTokens: stringSet(a.ServiceTokens), BypassPaths: stringList(a.BypassPaths),
-		Enabled: types.BoolValue(a.Enabled), Live: types.BoolValue(a.Live), URL: types.StringValue("https://" + a.Hostname),
+		Enabled: types.BoolValue(a.Enabled), Live: types.BoolValue(a.Live), NotLiveReason: strPtrValue(a.NotLiveReason),
+		AgentOnline: types.BoolValue(a.AgentConnected), CreatedAt: strPtrValue(a.CreatedAt), URL: types.StringValue("https://" + a.Hostname),
 	})...)
 }
 

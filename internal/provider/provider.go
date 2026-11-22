@@ -41,7 +41,7 @@ func (p *codigateProvider) Metadata(_ context.Context, _ provider.MetadataReques
 
 func (p *codigateProvider) Schema(_ context.Context, _ provider.SchemaRequest, resp *provider.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		Description: "Manage a Codigate workspace (agents, apps, access, edge rules, identity providers, domains, service tokens, log export, branding) through the workspace API /api/v1.",
+		Description: "Manage a Codigate workspace (agents, apps, access, edge rules, identity providers, domains, service tokens, log export, branding, alert channels) through the workspace API /api/v1.",
 		Attributes: map[string]schema.Attribute{
 			"api_url": schema.StringAttribute{
 				Optional:    true,
@@ -97,6 +97,7 @@ func (p *codigateProvider) Resources(context.Context) []func() resource.Resource
 		newServiceTokenResource,
 		newLogDestinationResource,
 		newBrandingResource,
+		newAlertsResource,
 	}
 }
 

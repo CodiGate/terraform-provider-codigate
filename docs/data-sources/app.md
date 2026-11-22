@@ -33,11 +33,14 @@ output "wiki_live" {
 ### Read-Only
 
 - `access` (String) protected (sign-in required) or public.
+- `agent_connected` (Boolean) Whether the app's agent is connected now.
 - `agent_id` (String) Agent that serves the app.
 - `bypass_paths` (List of String) Paths that skip the login.
+- `created_at` (String) When the app was created (RFC 3339).
 - `enabled` (Boolean) Whether the app is enabled.
 - `identity_provider_id` (String) Identity provider for login apps, null for the built-in email login.
 - `live` (Boolean) Whether the app serves traffic now.
 - `name` (String) App name.
+- `not_live_reason` (String) Why the app is not live (for example `needs a verified domain`), null when live.
 - `service_tokens` (Set of String) Service token ids allowed to reach the app.
 - `url` (String) https:// URL of the app.

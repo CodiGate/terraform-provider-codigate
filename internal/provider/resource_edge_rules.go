@@ -42,11 +42,18 @@ type challengeModel struct {
 	Difficulty    types.String `tfsdk:"difficulty"`
 	CookieMinutes types.Int64  `tfsdk:"cookie_minutes"`
 	AutoPerMinute types.Int64  `tfsdk:"auto_per_minute"`
+	SkipPaths     types.Set    `tfsdk:"skip_paths"`
+}
+
+type wafPathExclusionModel struct {
+	Path  types.String `tfsdk:"path"`
+	Rules types.Set    `tfsdk:"rules"`
 }
 
 type wafModel struct {
-	Mode       types.String `tfsdk:"mode"`
-	Exclusions types.Set    `tfsdk:"exclusions"`
+	Mode           types.String            `tfsdk:"mode"`
+	Exclusions     types.Set               `tfsdk:"exclusions"`
+	PathExclusions []wafPathExclusionModel `tfsdk:"path_exclusions"`
 }
 
 type edgeRulesModel struct {
@@ -162,9 +169,17 @@ func (r *edgeRulesResource) Schema(_ context.Context, _ resource.SchemaRequest, 
 					"cookie_minutes": schema.Int64Attribute{
 						Optional: true, Computed: true, Default: int64default.StaticInt64(30),
 						Description: "How long a solved challenge lasts (5-1440 minutes). Defaults to 30.",
+						Validators:  []validator.Int64{int64Between(5, 1440)},
 					},
 					"auto_per_minute": schema.Int64Attribute{
 						Optional: true, Description: "Requests per minute that turn the challenge on (mode auto only, 10-1000000).",
+						Validators: []validator.Int64{int64Between(10, 1000000)},
+					},
+					"skip_paths": schema.SetAttribute{
+						ElementType: types.StringType, Optional: true,
+						Description: "Path prefixes where no challenge is shown, for example /api/ or /webhooks/ (lowercase, not /, at most 50). " +
+							"Other edge rules, the WAF and the app's access settings still apply there.",
+						Validators: []validator.Set{scopePathSet, setSize{0, client.MaxChallengeSkipPath}},
 					},
 				},
 			},
@@ -178,7 +193,33 @@ func (r *edgeRulesResource) Schema(_ context.Context, _ resource.SchemaRequest, 
 					},
 					"exclusions": schema.SetAttribute{
 						ElementType: types.Int64Type, Optional: true,
-						Description: "CRS rule ids to skip, for example 942100 (at most 100).",
+						Description: "CRS rule ids to skip on the whole app, for example 942100 (at most 100).",
+						Validators: []validator.Set{
+							int64SetRange{min: 1, max: client.MaxWafRuleID},
+							setSize{0, client.MaxWafExclusions},
+						},
+					},
+					"path_exclusions": schema.ListNestedAttribute{
+						Optional: true,
+						Description: "CRS attack rules to skip only under a path prefix, for example rule 942100 under /api/search " +
+							"(at most 50 paths, each path once).",
+						Validators: []validator.List{listSize{client.MaxWafPathExclusions}},
+						NestedObject: schema.NestedAttributeObject{
+							Attributes: map[string]schema.Attribute{
+								"path": schema.StringAttribute{
+									Required: true, Description: "Lowercase path prefix, not /.",
+									Validators: []validator.String{scopePath},
+								},
+								"rules": schema.SetAttribute{
+									ElementType: types.Int64Type, Required: true,
+									Description: "CRS attack rule ids (910000-948999) to skip under the path, 1 to 20.",
+									Validators: []validator.Set{
+										int64SetRange{min: client.MinWafAttackRule, max: client.MaxWafAttackRule, hint: " (a CRS attack rule such as 942100)"},
+										setSize{1, client.MaxWafPathRules},
+									},
+								},
+							},
+						},
 					},
 				},
 			},
@@ -210,6 +251,19 @@ func (r *edgeRulesResource) ValidateConfig(ctx context.Context, req resource.Val
 		}
 		if c.Mode.ValueString() == "on" && !c.AutoPerMinute.IsNull() {
 			resp.Diagnostics.AddAttributeError(path.Root("challenge").AtName("auto_per_minute"), "Not used", "auto_per_minute only applies to challenge mode auto.")
+		}
+	}
+	if w := cfg.Waf; w != nil {
+		seenPath := map[string]bool{}
+		for i, e := range w.PathExclusions {
+			if e.Path.IsUnknown() || e.Path.IsNull() {
+				continue
+			}
+			if seenPath[e.Path.ValueString()] {
+				resp.Diagnostics.AddAttributeError(path.Root("waf").AtName("path_exclusions").AtListIndex(i).AtName("path"),
+					"Duplicate path", "List each path once, with all its rules.")
+			}
+			seenPath[e.Path.ValueString()] = true
 		}
 	}
 	seen := map[string]bool{}
@@ -250,11 +304,17 @@ func (m *edgeRulesModel) rules(ctx context.Context, diags *diag.Diagnostics) cli
 			v := c.AutoPerMinute.ValueInt64()
 			out.Challenge.AutoPerMinute = &v
 		}
+		out.Challenge.SkipPaths = nonEmpty(setStrings(ctx, c.SkipPaths, diags))
 	}
 	if w := m.Waf; w != nil {
-		out.Waf = &client.Waf{Mode: w.Mode.ValueString(), Exclusions: []int64{}}
+		out.Waf = &client.Waf{Mode: w.Mode.ValueString(), Exclusions: []int64{}, PathExclusions: []client.WafPathExclusion{}}
 		if !w.Exclusions.IsNull() && !w.Exclusions.IsUnknown() {
 			diags.Append(w.Exclusions.ElementsAs(ctx, &out.Waf.Exclusions, false)...)
+		}
+		for _, e := range w.PathExclusions {
+			x := client.WafPathExclusion{Path: e.Path.ValueString(), Rules: []int64{}}
+			diags.Append(e.Rules.ElementsAs(ctx, &x.Rules, false)...)
+			out.Waf.PathExclusions = append(out.Waf.PathExclusions, x)
 		}
 	}
 	return out
@@ -287,11 +347,16 @@ func (m *edgeRulesModel) fill(v *client.EdgeRulesView) {
 			WindowSeconds: types.Int64Value(b.WindowSeconds), DurationSeconds: types.Int64Value(b.DurationSeconds),
 		}
 	}
+	priorSkip := types.SetNull(types.StringType)
+	if m.Challenge != nil {
+		priorSkip = m.Challenge.SkipPaths
+	}
 	m.Challenge = nil
 	if c := r.Challenge; c != nil {
 		m.Challenge = &challengeModel{
 			Mode: types.StringValue(c.Mode), Difficulty: types.StringValue(c.Difficulty),
 			CookieMinutes: types.Int64Value(c.CookieMinutes), AutoPerMinute: types.Int64Null(),
+			SkipPaths: emptyIsNull(priorSkip, c.SkipPaths),
 		}
 		if c.AutoPerMinute != nil {
 			m.Challenge.AutoPerMinute = types.Int64Value(*c.AutoPerMinute)
@@ -303,6 +368,15 @@ func (m *edgeRulesModel) fill(v *client.EdgeRulesView) {
 		m.Waf = &wafModel{Mode: types.StringValue(w.Mode), Exclusions: types.SetNull(types.Int64Type)}
 		if len(w.Exclusions) > 0 || (priorWaf != nil && !priorWaf.Exclusions.IsNull()) {
 			m.Waf.Exclusions = int64Set(w.Exclusions)
+		}
+		// An empty list in the config stays [] in state; left out it stays null.
+		if len(w.PathExclusions) > 0 || (priorWaf != nil && priorWaf.PathExclusions != nil) {
+			m.Waf.PathExclusions = make([]wafPathExclusionModel, 0, len(w.PathExclusions))
+			for _, e := range w.PathExclusions {
+				m.Waf.PathExclusions = append(m.Waf.PathExclusions, wafPathExclusionModel{
+					Path: types.StringValue(e.Path), Rules: int64Set(e.Rules),
+				})
+			}
 		}
 	}
 	m.AdvancedAllowed = types.BoolValue(v.AdvancedAllowed)
